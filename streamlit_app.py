@@ -1,76 +1,105 @@
 import streamlit as st
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import T5Tokenizer, T5ForConditionalGeneration
 
-MODEL_NAME = "defog/sqlcoder-7b-2"  # change if you want another open-source model
+# Lightweight text-to-SQL model (T5-small based, good for Streamlit Cloud)
+MODEL_NAME = "cssupport/t5-small-awesome-text-to-sql"
 
 @st.cache_resource
 def load_model():
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        device_map="auto",
-        dtype=torch.float32,
-    )
-    return tokenizer, model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-tokenizer, model = load_model()
+    # Tokenizer from base t5-small as per model card
+    tokenizer = T5Tokenizer.from_pretrained("t5-small")
+
+    # Text-to-SQL model (small, CPU-friendly)
+    model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME)
+    model = model.to(device)
+    model.eval()
+
+    return tokenizer, model, device
+
+
+tokenizer, model, device = load_model()
+
 
 def build_prompt(schema: str, question: str) -> str:
-    return f"""You are an expert SQL generator.
+    """
+    Model expects:
+    tables:
+    CREATE TABLE ...;
+    CREATE TABLE ...;
+    query for: <question>
+    """
+    schema_clean = schema.strip()
+    question_clean = question.strip()
 
-Database schema:
-{schema}
+    prompt = (
+        "tables:\n"
+        + schema_clean
+        + "\n"
+        + "query for:"
+        + question_clean
+    )
+    return prompt
 
-Write a single SQL query that answers the question.
-Return ONLY the SQL query, without explanation, markdown, or backticks.
 
-Question: {question}
-SQL:
-"""
-
-def generate_sql(schema: str, question: str, max_new_tokens: int = 256) -> str:
+def generate_sql(schema: str, question: str, max_length: int = 256) -> str:
     prompt = build_prompt(schema, question)
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+    inputs = tokenizer(
+        prompt,
+        padding=True,
+        truncation=True,
+        return_tensors="pt"
+    ).to(device)
 
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            top_p=0.9,
-            temperature=0.3,
-            pad_token_id=tokenizer.eos_token_id,
+            max_length=max_length,
         )
 
-    full = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    sql = full.split("SQL:")[-1].strip()
-    return sql
+    generated_sql = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return generated_sql.strip()
 
-st.title("💬 SQL Generator Chatbot (Open-Source LLM)")
 
-default_schema = """TABLE customers (
+# ----------------------- Streamlit UI -----------------------
+
+st.title("💬 SQL Generator Chatbot (Lightweight Open-Source LLM)")
+
+st.markdown(
+    """
+Paste your **CREATE TABLE** schema below and ask a natural language question.
+The model will generate a SQL query.
+"""
+)
+
+default_schema = """CREATE TABLE customers (
   customer_id INT PRIMARY KEY,
   name VARCHAR(100),
   city VARCHAR(100),
   signup_date DATE
 );
 
-TABLE orders (
+CREATE TABLE orders (
   order_id INT PRIMARY KEY,
   customer_id INT,
   amount DECIMAL(10,2),
   order_date DATE,
   status VARCHAR(20)
-);
-"""
+);"""
 
-schema = st.text_area("Database schema", value=default_schema, height=220)
+schema = st.text_area("Database schema (as CREATE TABLE statements)", value=default_schema, height=220)
 question = st.text_input("Ask a question about your data")
 
 if st.button("Generate SQL"):
-    if not schema.strip() or not question.strip():
-        st.warning("Please enter both schema and question.")
+    if not schema.strip():
+        st.warning("Please provide a database schema.")
+    elif not question.strip():
+        st.warning("Please enter a question.")
     else:
-        sql = generate_sql(schema, question)
+        with st.spinner("Generating SQL..."):
+            sql = generate_sql(schema, question)
+        st.subheader("Generated SQL")
         st.code(sql, language="sql")
